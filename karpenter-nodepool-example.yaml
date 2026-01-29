@@ -1,0 +1,114 @@
+---
+# Example Karpenter NodePool configuration with drift detection enabled
+# This enables automatic detection of AMI changes and node replacement
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  # Template defines the node configuration
+  template:
+    metadata:
+      labels:
+        intent: apps
+        managed-by: karpenter
+    spec:
+      # Define node requirements (instance types, capacity type, etc.)
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["t3.medium", "t3.large", "t3a.medium", "t3a.large"]
+
+      # Reference to the EC2NodeClass for AMI selection
+      nodeClassRef:
+        name: default
+
+  # Limits for the NodePool
+  limits:
+    cpu: "1000"
+    memory: 1000Gi
+
+  # Disruption settings - THIS IS KEY FOR DRIFT DETECTION
+  disruption:
+    # Consolidation settings
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+
+    # DRIFT DETECTION - Enable automatic replacement when configuration changes
+    # This will detect AMI changes and automatically replace nodes
+    budgets:
+      - nodes: "10%"  # Allow up to 10% of nodes to be disrupted at once
+        # Alternatively, use a fixed number:
+        # - nodes: "2"  # Allow up to 2 nodes to be disrupted at once
+
+    # Optionally set expireAfter to automatically expire nodes after a duration
+    # Useful for ensuring nodes are refreshed even without drift
+    # expireAfter: 720h  # 30 days
+
+---
+# Example EC2NodeClass configuration
+# This is where you specify the AMI and other EC2-specific configuration
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  # AMI Selection - Karpenter will detect when this changes
+  amiFamily: AL2  # Amazon Linux 2
+
+  # Option 1: Use AMI Selector to automatically find latest AMI
+  amiSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${CLUSTER_NAME}  # Replace with your cluster name
+    # Optionally specify AMI name pattern
+    # - name: "amazon-eks-node-1.28-*"
+
+  # Option 2: Specify exact AMI ID (update this to trigger drift detection)
+  # amiSelectorTerms:
+  #   - id: ami-1234567890abcdef0
+
+  # IAM Role for nodes
+  role: KarpenterNodeRole-${CLUSTER_NAME}  # Replace with your node IAM role
+
+  # Subnet selection
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${CLUSTER_NAME}  # Replace with your cluster name
+
+  # Security group selection
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${CLUSTER_NAME}  # Replace with your cluster name
+
+  # User data for node customization
+  userData: |
+    #!/bin/bash
+    # Add any custom initialization here
+    echo "Node initialized by Karpenter"
+
+  # Block device mappings
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+
+  # Metadata options
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 2
+    httpTokens: required  # Require IMDSv2
+
+  # Tags for EC2 instances
+  tags:
+    ManagedBy: Karpenter
+    Environment: production

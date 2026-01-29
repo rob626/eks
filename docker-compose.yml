@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  reroll:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eks-reroll:latest
+    container_name: eks-reroll
+    volumes:
+      # Mount kubeconfig for cluster access
+      - ${HOME}/.kube:/root/.kube:ro
+      # Optional: Mount AWS credentials if needed
+      - ${HOME}/.aws:/root/.aws:ro
+    environment:
+      # Set kubeconfig path
+      - KUBECONFIG=/root/.kube/config
+      # Optional: Set AWS region
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      # Optional: Set AWS profile
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+    # Override with actual command
+    command: ["--help"]
+
+# Usage examples:
+#
+# Dry run:
+#   docker-compose run --rm reroll --dry-run
+#
+# Re-roll all nodes:
+#   docker-compose run --rm reroll
+#
+# Re-roll specific NodePool:
+#   docker-compose run --rm reroll --nodepool my-nodepool
+#
+# Re-roll with verbose logging:
+#   docker-compose run --rm reroll --verbose
+#
+# Re-roll nodes matching labels:
+#   docker-compose run --rm reroll --label env=prod --label team=platform
