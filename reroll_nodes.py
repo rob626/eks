@@ -68,7 +68,7 @@ class NodeReroller:
         self.ec2_client = None
         if not skip_ec2_termination:
             try:
-                self.ec2_client = boto3.client('ec2')  # Auto-detects region
+                self.ec2_client = boto3.client('ec2', verify=False)  # Auto-detects region
                 logger.info(f"Initialized EC2 client for region: {self.ec2_client.meta.region_name}")
             except NoCredentialsError:
                 logger.warning("AWS credentials not found. EC2 termination will be skipped.")
