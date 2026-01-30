@@ -34,7 +34,7 @@ make dry-run
 ### Example 2: Simple Re-roll
 
 ```bash
-# Preview changes
+# Preview changes (shows EC2 instance IDs that would be terminated)
 make dry-run
 
 # If everything looks good, execute
@@ -42,6 +42,18 @@ make run
 
 # Monitor progress in another terminal
 kubectl get nodes -w
+```
+
+### Example 3: Re-roll Without EC2 Termination
+
+If Karpenter is properly cleaning up EC2 instances or you don't have EC2 termination permissions:
+
+```bash
+# Preview without EC2 termination
+make docker-run ARGS='--skip-ec2-termination --dry-run'
+
+# Execute re-roll (Kubernetes nodes only)
+make docker-run ARGS='--skip-ec2-termination --verbose'
 ```
 
 ## Production Scenarios
@@ -157,7 +169,7 @@ Critical CVE requires immediate node updates across all environments.
 argocd app sync --all
 
 # 3. For each cluster/environment, run aggressive re-roll
-# Dev environment (faster)
+# Dev environment (faster, with EC2 termination to ensure cleanup)
 make docker-run ARGS='--wait-between 30 --verbose'
 
 # Staging environment (moderate)
@@ -165,11 +177,38 @@ make docker-run ARGS='--wait-between 60 --verbose'
 
 # Production (still aggressive but safer)
 make docker-run ARGS='--wait-between 90 --drain-timeout 600 --verbose'
+
+# Note: EC2 instances are terminated by default to prevent dangling instances
+# Use --skip-ec2-termination if you want to rely on Karpenter's cleanup
+```
+
+### Scenario 7: Troubleshooting Dangling EC2 Instances
+
+If you notice EC2 instances remain after node deletion:
+
+```bash
+# 1. Check for dangling instances in AWS Console or CLI
+aws ec2 describe-instances \
+  --filters "Name=tag:karpenter.sh/nodepool,Values=*" \
+  --query 'Reservations[*].Instances[*].[InstanceId,State.Name,Tags[?Key==`Name`].Value|[0]]' \
+  --output table
+
+# 2. Run re-roll with verbose output to see EC2 termination details
+make docker-run ARGS='--verbose --dry-run'
+
+# 3. Execute re-roll (EC2 termination is enabled by default)
+make run
+
+# 4. Verify instances are terminating
+aws ec2 describe-instances \
+  --instance-ids i-xxxxx \
+  --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' \
+  --output table
 ```
 
 ## Advanced Use Cases
 
-### Scenario 7: Multi-Environment Automation
+### Scenario 8: Multi-Environment Automation
 
 You manage multiple EKS clusters and want to automate the re-roll process.
 
@@ -207,7 +246,7 @@ for i in "${!CLUSTERS[@]}"; do
 done
 ```
 
-### Scenario 8: Filtering by Multiple Labels
+### Scenario 9: Filtering by Multiple Labels
 
 Re-roll only nodes that match specific criteria.
 
@@ -222,7 +261,7 @@ make docker-run ARGS='--label team=platform --label env=prod'
 make docker-run ARGS='--label karpenter.sh/capacity-type=spot'
 ```
 
-### Scenario 9: Testing in Development
+### Scenario 10: Testing in Development
 
 Before rolling out to production, test the process in dev.
 
@@ -246,7 +285,7 @@ make run
 
 ## Integration Examples
 
-### Example 10: GitLab CI/CD Pipeline
+### Example 11: GitLab CI/CD Pipeline
 
 ```yaml
 # .gitlab-ci.yml
@@ -338,7 +377,7 @@ reroll-prod:
     - main
 ```
 
-### Example 11: GitHub Actions Workflow
+### Example 12: GitHub Actions Workflow
 
 ```yaml
 # .github/workflows/update-eks-nodes.yml
@@ -436,7 +475,7 @@ jobs:
             --wait-between 90 --verbose
 ```
 
-### Example 12: Kubernetes CronJob for Automated Maintenance
+### Example 13: Kubernetes CronJob for Automated Maintenance
 
 Deploy the re-roll tool as a Kubernetes CronJob for scheduled maintenance.
 

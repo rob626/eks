@@ -14,6 +14,8 @@ from typing import List, Optional, Set
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 
 # Configure logging
 logging.basicConfig(
@@ -32,7 +34,8 @@ class NodeReroller:
         drain_timeout: int = 300,
         wait_between_nodes: int = 30,
         dry_run: bool = False,
-        selector: Optional[dict] = None
+        selector: Optional[dict] = None,
+        skip_ec2_termination: bool = False
     ):
         """
         Initialize the NodeReroller.
@@ -43,12 +46,14 @@ class NodeReroller:
             wait_between_nodes: Wait time in seconds between node deletions
             dry_run: If True, only show what would be done
             selector: Label selector for filtering nodes
+            skip_ec2_termination: If True, skip EC2 instance termination
         """
         self.max_concurrent = max_concurrent
         self.drain_timeout = drain_timeout
         self.wait_between_nodes = wait_between_nodes
         self.dry_run = dry_run
         self.selector = selector or {}
+        self.skip_ec2_termination = skip_ec2_termination
 
         # Initialize Kubernetes clients
         try:
@@ -58,6 +63,17 @@ class NodeReroller:
 
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
+
+        # Initialize EC2 client (only if not skipping termination)
+        self.ec2_client = None
+        if not skip_ec2_termination:
+            try:
+                self.ec2_client = boto3.client('ec2')  # Auto-detects region
+                logger.info(f"Initialized EC2 client for region: {self.ec2_client.meta.region_name}")
+            except NoCredentialsError:
+                logger.warning("AWS credentials not found. EC2 termination will be skipped.")
+            except Exception as e:
+                logger.warning(f"Failed to initialize EC2 client: {e}")
 
     def get_karpenter_nodes(self) -> List[client.V1Node]:
         """Get all Karpenter-managed nodes matching the selector."""
@@ -233,19 +249,129 @@ class NodeReroller:
             logger.error(f"Failed to drain node {node_name}: {e}")
             return False
 
-    def delete_node(self, node_name: str) -> bool:
-        """Delete a node, triggering Karpenter to create a replacement."""
+    def get_instance_id_from_node(self, node: client.V1Node) -> Optional[str]:
+        """
+        Extract EC2 instance ID from Kubernetes node.
+
+        Args:
+            node: Kubernetes node object
+
+        Returns:
+            EC2 instance ID or None if not found
+        """
+        node_name = node.metadata.name
+
+        # 1. Try spec.providerID
+        if node.spec.provider_id and node.spec.provider_id.startswith('aws://'):
+            parts = node.spec.provider_id.split('/')
+            if len(parts) >= 2 and parts[-1].startswith('i-'):
+                logger.debug(f"Found instance ID from providerID: {parts[-1]}")
+                return parts[-1]
+
+        # 2. Try annotations
+        if node.metadata.annotations:
+            for key in ['karpenter.sh/instance-id', 'node.kubernetes.io/instance-id']:
+                if key in node.metadata.annotations:
+                    value = node.metadata.annotations[key]
+                    if value.startswith('i-'):
+                        logger.debug(f"Found instance ID from annotation {key}: {value}")
+                        return value
+
+        # 3. Lookup by private IP
+        if self.ec2_client and node.status.addresses:
+            for address in node.status.addresses:
+                if address.type == "InternalIP":
+                    try:
+                        logger.debug(f"Looking up EC2 instance by IP: {address.address}")
+                        response = self.ec2_client.describe_instances(
+                            Filters=[
+                                {'Name': 'private-ip-address', 'Values': [address.address]},
+                                {'Name': 'instance-state-name', 'Values': ['running', 'pending']}
+                            ]
+                        )
+                        for reservation in response.get('Reservations', []):
+                            for instance in reservation.get('Instances', []):
+                                instance_id = instance['InstanceId']
+                                logger.debug(f"Found instance ID from IP lookup: {instance_id}")
+                                return instance_id
+                    except Exception as e:
+                        logger.warning(f"EC2 lookup by IP failed: {e}")
+                    break
+
+        logger.warning(f"Could not determine EC2 instance ID for node: {node_name}")
+        return None
+
+    def terminate_ec2_instance(self, instance_id: str, node_name: str) -> bool:
+        """
+        Terminate EC2 instance via boto3.
+
+        Args:
+            instance_id: EC2 instance ID
+            node_name: Kubernetes node name (for logging)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.ec2_client:
+            return False
+
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would delete node: {node_name}")
+            logger.info(f"[DRY RUN] Would terminate EC2 instance: {instance_id} (node: {node_name})")
             return True
 
         try:
+            response = self.ec2_client.terminate_instances(InstanceIds=[instance_id])
+
+            if response['TerminatingInstances']:
+                terminating = response['TerminatingInstances'][0]
+                prev_state = terminating['PreviousState']['Name']
+                curr_state = terminating['CurrentState']['Name']
+                logger.info(f"Terminated EC2 instance: {instance_id} (node: {node_name}) [{prev_state} → {curr_state}]")
+                return True
+            return False
+
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == 'InvalidInstanceID.NotFound':
+                logger.warning(f"EC2 instance {instance_id} not found (may already be terminated)")
+            elif error_code == 'UnauthorizedOperation':
+                logger.error(f"Not authorized to terminate instance {instance_id}. Check IAM permissions.")
+            else:
+                logger.error(f"Failed to terminate instance {instance_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error terminating instance {instance_id}: {e}")
+            return False
+
+    def delete_node(self, node: client.V1Node) -> bool:
+        """Delete a node and its EC2 instance, triggering Karpenter to create a replacement."""
+        node_name = node.metadata.name
+
+        if self.dry_run:
+            instance_id = self.get_instance_id_from_node(node) if not self.skip_ec2_termination else None
+            if instance_id:
+                logger.info(f"[DRY RUN] Would delete node: {node_name} (EC2 instance: {instance_id})")
+            else:
+                logger.info(f"[DRY RUN] Would delete node: {node_name}")
+            return True
+
+        # Delete K8s node first
+        try:
             self.core_v1.delete_node(node_name)
             logger.info(f"Deleted node: {node_name}")
-            return True
         except ApiException as e:
             logger.error(f"Failed to delete node {node_name}: {e}")
             return False
+
+        # Terminate EC2 instance
+        if not self.skip_ec2_termination and self.ec2_client:
+            instance_id = self.get_instance_id_from_node(node)
+            if instance_id:
+                self.terminate_ec2_instance(instance_id, node_name)
+            else:
+                logger.warning(f"EC2 instance ID not found for {node_name}, skipping EC2 termination")
+
+        return True
 
     def wait_for_replacement(self, original_count: int) -> bool:
         """Wait for Karpenter to provision replacement nodes."""
@@ -278,13 +404,14 @@ class NodeReroller:
         logger.warning("Timeout waiting for replacement nodes")
         return False
 
-    def reroll_node(self, node: client.V1Node, original_count: int) -> bool:
+    def reroll_node(self, node: client.V1Node, original_count: int, skip_wait: bool = False) -> bool:
         """
         Reroll a single node: cordon, drain, delete, and wait for replacement.
 
         Args:
             node: The node to reroll
             original_count: Original number of ready nodes
+            skip_wait: If True, skip the wait between nodes (for retry attempts)
 
         Returns:
             True if successful, False otherwise
@@ -294,15 +421,16 @@ class NodeReroller:
 
         # Step 1: Cordon
         if not self.cordon_node(node_name):
-            return False
+            logger.warning(f"Failed to cordon node: {node_name}, continuing anyway...")
 
         # Step 2: Drain
         if not self.drain_node(node_name):
-            logger.error(f"Failed to drain node: {node_name}")
+            logger.warning(f"Failed to drain node: {node_name}")
             return False
 
         # Step 3: Delete
-        if not self.delete_node(node_name):
+        if not self.delete_node(node):
+            logger.warning(f"Failed to delete node: {node_name}")
             return False
 
         # Step 4: Wait for replacement
@@ -310,7 +438,7 @@ class NodeReroller:
             logger.warning("Proceeding despite replacement timeout")
 
         # Wait between nodes
-        if self.wait_between_nodes > 0:
+        if not skip_wait and self.wait_between_nodes > 0:
             logger.info(f"Waiting {self.wait_between_nodes}s before next node...")
             time.sleep(self.wait_between_nodes)
 
@@ -362,19 +490,29 @@ class NodeReroller:
             )
         ])
 
-        # Re-roll nodes
+        # Re-roll nodes (first pass)
         failed_nodes = []
         for i, node in enumerate(nodes, 1):
             logger.info(f"Processing node {i}/{len(nodes)}")
 
             if not self.reroll_node(node, original_count - (i - 1)):
-                failed_nodes.append(node.metadata.name)
-                logger.error(f"Failed to re-roll node: {node.metadata.name}")
+                failed_nodes.append(node)
+                logger.warning(f"Failed to re-roll node: {node.metadata.name}, will retry later")
 
-                # Ask whether to continue
-                if i < len(nodes):
-                    logger.warning("Stopping due to failure")
-                    break
+        # Retry failed nodes
+        if failed_nodes:
+            logger.info("=" * 60)
+            logger.info(f"Retrying {len(failed_nodes)} failed node(s)...")
+            retry_failed = []
+
+            for i, node in enumerate(failed_nodes, 1):
+                logger.info(f"Retry attempt {i}/{len(failed_nodes)} for node: {node.metadata.name}")
+
+                if not self.reroll_node(node, original_count, skip_wait=(i == len(failed_nodes))):
+                    retry_failed.append(node.metadata.name)
+                    logger.error(f"Retry failed for node: {node.metadata.name}")
+
+            failed_nodes = retry_failed
 
         # Summary
         logger.info("=" * 60)
@@ -384,7 +522,7 @@ class NodeReroller:
         logger.info(f"  Failed: {len(failed_nodes)}")
 
         if failed_nodes:
-            logger.error(f"Failed nodes: {', '.join(failed_nodes)}")
+            logger.error(f"Failed nodes after retry: {', '.join(failed_nodes)}")
             return 1
 
         logger.info("All nodes re-rolled successfully")
@@ -460,6 +598,12 @@ Examples:
         help='Enable verbose logging'
     )
 
+    parser.add_argument(
+        '--skip-ec2-termination',
+        action='store_true',
+        help='Skip EC2 instance termination (only delete Kubernetes nodes)'
+    )
+
     return parser.parse_args()
 
 
@@ -491,7 +635,8 @@ def main():
         drain_timeout=args.drain_timeout,
         wait_between_nodes=args.wait_between,
         dry_run=args.dry_run,
-        selector=selector if selector else None
+        selector=selector if selector else None,
+        skip_ec2_termination=args.skip_ec2_termination
     )
 
     sys.exit(reroller.run())

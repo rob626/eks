@@ -29,14 +29,38 @@ This project provides two complementary approaches for keeping your EKS nodes up
 ### Docker (Recommended)
 - Docker and Docker Compose
 - kubectl configured with access to your EKS cluster (~/.kube/config)
+- AWS credentials configured (~/.aws/credentials or environment variables)
 - Karpenter v0.32+ (for drift detection feature)
-- Appropriate IAM permissions to manage nodes
+- Appropriate IAM permissions (see below)
 
 ### Local Python (Alternative)
 - Python 3.8+
 - kubectl configured with access to your EKS cluster
+- AWS credentials configured
 - Karpenter v0.32+ (for drift detection feature)
-- Appropriate IAM permissions to manage nodes
+- Appropriate IAM permissions (see below)
+
+### Required IAM Permissions
+
+The script requires the following AWS IAM permissions for EC2 instance termination:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:TerminateInstances"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+If you don't have these permissions or prefer not to terminate EC2 instances directly, use the `--skip-ec2-termination` flag.
 
 ## Installation
 
@@ -234,15 +258,19 @@ python reroll_nodes.py --label env=prod
 - `--nodepool NAME`: Only re-roll nodes from this NodePool
 - `--label KEY=VALUE`: Additional label selector (can be specified multiple times)
 - `--verbose`: Enable verbose logging
+- `--skip-ec2-termination`: Skip EC2 instance termination (only delete Kubernetes nodes)
 
 ### How the Script Works
 
 For each node:
 1. **Cordon** - Mark node as unschedulable
 2. **Drain** - Evict all pods (respecting PodDisruptionBudgets)
-3. **Delete** - Delete the node
-4. **Wait** - Wait for Karpenter to provision a replacement
-5. **Verify** - Check that new node is ready before proceeding
+3. **Delete** - Delete the Kubernetes node
+4. **Terminate** - Terminate the EC2 instance (to prevent dangling instances)
+5. **Wait** - Wait for Karpenter to provision a replacement
+6. **Verify** - Check that new node is ready before proceeding
+
+**Note**: EC2 instance termination is enabled by default. If Karpenter is properly cleaning up instances in your environment, you can disable this with `--skip-ec2-termination`.
 
 ### Safety Features
 
