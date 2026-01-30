@@ -16,6 +16,10 @@ from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
+import urllib3
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging
 logging.basicConfig(
