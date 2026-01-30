@@ -39,7 +39,8 @@ class NodeReroller:
         wait_between_nodes: int = 30,
         dry_run: bool = False,
         selector: Optional[dict] = None,
-        skip_ec2_termination: bool = False
+        skip_ec2_termination: bool = False,
+        verbose: bool = False
     ):
         """
         Initialize the NodeReroller.
@@ -51,6 +52,7 @@ class NodeReroller:
             dry_run: If True, only show what would be done
             selector: Label selector for filtering nodes
             skip_ec2_termination: If True, skip EC2 instance termination
+            verbose: If True, enable verbose logging
         """
         self.max_concurrent = max_concurrent
         self.drain_timeout = drain_timeout
@@ -58,6 +60,7 @@ class NodeReroller:
         self.dry_run = dry_run
         self.selector = selector or {}
         self.skip_ec2_termination = skip_ec2_termination
+        self.verbose = verbose
 
         # Initialize Kubernetes clients
         try:
@@ -97,8 +100,10 @@ class NodeReroller:
                 # Check if node is managed by Karpenter
                 # Karpenter v1beta1 uses karpenter.sh/nodepool
                 # Karpenter v1alpha5 uses karpenter.sh/provisioner-name
-                if not (labels.get('karpenter.sh/nodepool') or
-                       labels.get('karpenter.sh/provisioner-name')):
+                nodepool_v1beta1 = labels.get('karpenter.sh/nodepool', '').strip()
+                nodepool_v1alpha5 = labels.get('karpenter.sh/provisioner-name', '').strip()
+
+                if not (nodepool_v1beta1 or nodepool_v1alpha5):
                     continue
 
                 # Apply additional label selectors if provided
@@ -112,6 +117,38 @@ class NodeReroller:
         except ApiException as e:
             logger.error(f"Failed to list nodes: {e}")
             sys.exit(1)
+
+    def _get_nodepool_name(self, node: client.V1Node) -> str:
+        """
+        Extract nodepool name from node labels with proper fallback logic.
+
+        Args:
+            node: Kubernetes node object
+
+        Returns:
+            Nodepool name or 'unknown' if not found
+        """
+        labels = node.metadata.labels or {}
+
+        # Try v1beta1 label first
+        nodepool = labels.get('karpenter.sh/nodepool', '').strip()
+        if nodepool:
+            return nodepool
+
+        # Try v1alpha5 label
+        nodepool = labels.get('karpenter.sh/provisioner-name', '').strip()
+        if nodepool:
+            return nodepool
+
+        # Log warning if we couldn't find nodepool
+        node_name = node.metadata.name
+        logger.warning(
+            f"Node {node_name} has no valid nodepool label. "
+            f"Labels: karpenter.sh/nodepool={labels.get('karpenter.sh/nodepool')}, "
+            f"karpenter.sh/provisioner-name={labels.get('karpenter.sh/provisioner-name')}"
+        )
+
+        return 'unknown'
 
     def check_cluster_health(self) -> bool:
         """Check if the cluster has enough capacity before proceeding."""
@@ -481,10 +518,18 @@ class NodeReroller:
         # Show nodes
         for node in nodes:
             labels = node.metadata.labels or {}
-            nodepool = labels.get('karpenter.sh/nodepool') or \
-                      labels.get('karpenter.sh/provisioner-name', 'unknown')
+            nodepool = self._get_nodepool_name(node)
             instance_type = labels.get('node.kubernetes.io/instance-type', 'unknown')
             logger.info(f"  - {node.metadata.name} (nodepool={nodepool}, type={instance_type})")
+
+            # Show verbose label details for debugging
+            if self.verbose or self.dry_run:
+                nodepool_v1beta1 = labels.get('karpenter.sh/nodepool', 'not set')
+                nodepool_v1alpha5 = labels.get('karpenter.sh/provisioner-name', 'not set')
+                logger.debug(
+                    f"    Labels: karpenter.sh/nodepool={nodepool_v1beta1}, "
+                    f"karpenter.sh/provisioner-name={nodepool_v1alpha5}"
+                )
 
         if self.dry_run:
             logger.info("[DRY RUN] Would re-roll the above nodes")
@@ -645,7 +690,8 @@ def main():
         wait_between_nodes=args.wait_between,
         dry_run=args.dry_run,
         selector=selector if selector else None,
-        skip_ec2_termination=args.skip_ec2_termination
+        skip_ec2_termination=args.skip_ec2_termination,
+        verbose=args.verbose
     )
 
     sys.exit(reroller.run())
