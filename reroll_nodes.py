@@ -61,6 +61,11 @@ class NodeReroller:
         except Exception:
             config.load_incluster_config()
 
+        # Disable SSL verification for Kubernetes client
+        k8s_config = client.Configuration.get_default_copy()
+        k8s_config.verify_ssl = False
+        client.Configuration.set_default(k8s_config)
+
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
 
